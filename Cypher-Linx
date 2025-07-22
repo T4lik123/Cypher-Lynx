@@ -1,0 +1,1182 @@
+/*
+ * Cypher-Lynx: ESP32-C3 Multi-Protocol Reverse Engineering Tool
+ * Version 1.0.0
+ *
+ * Features:
+ * - RS485 Modbus RTU protocol analysis (sniffing, decoding, web logging)
+ * - Bluetooth Low Energy (BLE) protocol analysis (scanning, GATT discovery, web logging)
+ * - Web interface for comprehensive remote control, mode switching, and log viewing
+ * - OLED and TFT display support for on-device status
+ * - Serial Bridge mode for direct USB-to-RS485 interaction
+ * - Basic signal quality and cryptographic analysis hooks (expandable)
+ *
+ * This tool is designed to help reverse engineer communication protocols of
+ * embedded devices, particularly inverters using RS485 and BLE.
+ */
+
+#include <WiFi.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <U8g2lib.h>
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEServer.h>
+#include <BLEScan.h>
+#include <BLEAdvertisedDevice.h>
+#include <Preferences.h> // For storing settings if needed (not actively used in this example yet)
+#include <PacketSerial.h> // Primarily for RS485 packet handling
+#include <ArduinoJson.h> // For potential JSON parsing (not actively used in this example yet)
+#include <arduinoFFT.h> // For signal analysis
+#include <mbedtls/md5.h> // For crypto analysis
+#include <mbedtls/sha256.h> // For crypto analysis
+#include <TFT_eSPI.h> // For TFT display
+
+// ====== HARDWARE CONFIGURATION ======
+// These pins are for connecting to the inverter's RS485 bus.
+// CRITICAL: Verify voltage compatibility. ESP32 GPIOs are 3.3V tolerant.
+// If inverter's RS485 uses 5V logic, a logic level shifter is REQUIRED.
+#define RS485_RX_PIN 20 // Connect to Inverter RS485 A line (via level shifter if needed)
+#define RS485_TX_PIN 21 // Connect to Inverter RS485 B line (via level shifter if needed)
+// These pins control the direction of an external RS485 transceiver (like TP8485E).
+// If your ESP32 is connecting directly to the inverter's internal RS485 transceiver,
+// these pins might not be strictly necessary for control, but are good to define
+// for general RS485 handling or if an external transceiver is ever used.
+#define RS485_DE_PIN 4  // Driver Enable (HIGH for TX, LOW for RX)
+#define RS485_RE_PIN 2  // Receiver Enable (LOW for RX, HIGH for TX) - active low
+
+#define OLED_SCL 6 // I2C SCL for OLED
+#define OLED_SDA 5 // I2C SDA for OLED
+#define ADC_PIN 0  // Analog pin for signal strength monitoring (e.g., connect to RS485 A/B via voltage divider)
+
+// ====== OLED CONFIG ======
+// U8G2_SSD1306_72X40_ER_F_HW_I2C(rotation, reset, clock, data)
+U8G2_SSD1306_72X40_ER_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE, OLED_SCL, OLED_SDA);
+
+// ====== TFT DISPLAY CONFIG ======
+TFT_eSPI tft = TFT_eSPI();
+
+// ====== PACKET HANDLING (for RS485) ======
+// Uses COBS encoding for robust packet framing over serial.
+PacketSerial_<COBS, 0, 256> packetSerial; 
+
+// ====== PROTOCOL ANALYSIS TOOLS ======
+arduinoFFT FFT = arduinoFFT();
+mbedtls_md5_context md5_ctx;
+mbedtls_sha256_context sha_ctx;
+
+// ====== NETWORK CONFIG (ESP32 creates its own Wi-Fi Access Point) ======
+AsyncWebServer server(80);
+const char* ssid = "RE_Tool_AP"; // Default Wi-Fi AP Name
+const char* password = "reverse_engineer"; // Default Wi-Fi AP Password
+IPAddress local_ip(192,168,1,1); // Default IP for the ESP32's AP
+IPAddress gateway(192,168,1,1);
+IPAddress subnet(255,255,255,0);
+
+// ====== WEB SERVER AUTHENTICATION ======
+const char* http_username = "admin"; // Default Web UI Username
+const char* http_password = "securepass"; // Default Web UI Password
+
+// ====== GLOBAL STATE ======
+enum OperatingMode { MODE_RS485, MODE_BLE, MODE_BRIDGE } currentMode = MODE_BLE; // Default to BLE for app analysis
+bool sniffingActive = true; // General flag for sniffing (can be expanded for more granular control)
+bool mitmActive = false; // Man-in-the-middle (advanced feature, not implemented yet)
+bool fuzzingActive = false; // Automated testing (advanced feature, not implemented yet)
+
+// ====== LOGGING BUFFERS ======
+// These strings store the log data to be served via the web interface.
+String rs485LogDataRaw = "";      // Stores raw RS485 hex packets
+String rs485LogDataDecoded = "";  // Stores decoded RS485 data
+String bleLogData = "";           // Stores BLE scanning, connection, and GATT event logs
+const int MAX_LOG_SIZE = 10000;   // Maximum characters for log buffers (prevents memory overflow)
+
+// Helper function to append to logs and manage their size
+void appendToLog(String& logBuffer, const String& message) {
+    logBuffer += message + "\n";
+    if (logBuffer.length() > MAX_LOG_SIZE) {
+        // Truncate from the beginning to keep the log manageable
+        logBuffer = logBuffer.substring(logBuffer.length() - MAX_LOG_SIZE / 2);
+        if (!logBuffer.startsWith("...TRUNCATED...\n")) {
+            logBuffer = "...TRUNCATED...\n" + logBuffer;
+        }
+    }
+}
+
+// ====== RS485 Transceiver Control Functions ======
+// Sets the TP8485E (or similar) transceiver to receive mode.
+// DE (Driver Enable) LOW, RE (Receiver Enable) LOW (active low).
+void setRS485ReceiveMode() {
+  digitalWrite(RS485_DE_PIN, LOW);  // Disable Driver (prevent transmission)
+  digitalWrite(RS485_RE_PIN, LOW); // Enable Receiver (active low, allow reception)
+}
+
+// Sets the TP8485E (or similar) transceiver to transmit mode.
+// DE (Driver Enable) HIGH, RE (Receiver Enable) HIGH.
+void setRS485TransmitMode() {
+  digitalWrite(RS485_RE_PIN, HIGH); // Disable Receiver
+  digitalWrite(RS485_DE_PIN, HIGH); // Enable Driver
+}
+
+// ====== Modbus RTU CRC-16 Calculation Function ======
+// Implements the standard Modbus RTU CRC-16 algorithm (Polynomial 0xA001, initial value 0xFFFF).
+unsigned int calculateCRC16(uint8_t *buf, int len) {
+  unsigned int crc = 0xFFFF;
+  for (int pos = 0; pos < len; pos++) {
+    crc ^= (unsigned int)buf[pos]; // XOR byte into least sig. byte of crc
+    for (int i = 8; i != 0; i--) { // Loop over each bit
+      if ((crc & 0x0001) != 0) { // If the LSB is set
+        crc >>= 1; // Shift right and XOR 0xA001
+        crc ^= 0xA001;
+      } else { // Else LSB is not set
+        crc >>= 1; // Just shift right
+      }
+    }
+  }
+  // Modbus RTU CRC is typically transmitted low byte first, then high byte.
+  return crc;
+}
+
+// ====== Modbus RTU Decoding Function ======
+// Decodes a raw Modbus RTU frame into a human-readable string.
+// Includes CRC validation and basic interpretation of common function codes.
+String decodeModbusFrame(uint8_t *frame, uint8_t length) {
+  if (length < 4) { // Minimum Modbus RTU frame: Addr + Func + CRC (2 bytes)
+    return "Too short for Modbus RTU.";
+  }
+
+  uint8_t slaveID = frame[0];
+  uint8_t functionCode = frame[1];
+  unsigned int receivedCRC = (unsigned int)frame[length - 1] << 8 | frame[length - 2];
+  unsigned int calculatedCRC = calculateCRC16(frame, length - 2); // Calculate CRC over all bytes except the last two
+
+  String decoded = "Slave ID: 0x" + String(slaveID, HEX) + " (Dec: " + String(slaveID) + ")\n";
+  decoded += "Function: 0x" + String(functionCode, HEX) + " ";
+
+  if (receivedCRC != calculatedCRC) {
+    decoded += "(CRC Mismatch! Expected: 0x" + String(calculatedCRC, HEX) + ", Got: 0x" + String(receivedCRC, HEX) + ")\n";
+    decoded += "Raw Payload (with invalid CRC): ";
+    for (int i = 0; i < length; i++) {
+        char hexChar[3];
+        sprintf(hexChar, "%02X", frame[i]);
+        decoded += String(hexChar) + " ";
+    }
+    decoded.trim();
+    return decoded;
+  }
+
+  // Handle common function codes (add more as you discover them for your inverter)
+  if (functionCode == 0x03 || functionCode == 0x04) { // Read Holding/Input Registers Response
+    if (length < 5) return decoded + "(Invalid 0x03/0x04 response length - too short for byte count).";
+    uint8_t byteCount = frame[2];
+    if (byteCount != (length - 5)) return decoded + "(Byte count mismatch in 0x03/0x04 response).";
+
+    decoded += "(Read Registers Response)\n";
+    decoded += "Data (" + String(byteCount / 2) + " registers):\n";
+    for (int i = 0; i < byteCount / 2; i++) {
+      // Registers are 16-bit, Big Endian (High Byte first, then Low Byte)
+      unsigned int regValue = (unsigned int)frame[3 + (i * 2)] << 8 | frame[3 + (i * 2) + 1];
+      decoded += "  Reg " + String(i) + " (0x" + String(3 + (i * 2) - 3, HEX) + "): " + String(regValue) + " (0x" + String(regValue, HEX) + ")\n";
+    }
+  } else if ((functionCode & 0x80) != 0) { // Exception Response (MSB of function code is set)
+    if (length < 4) return decoded + "(Invalid exception response length).";
+    uint8_t originalFunctionCode = functionCode & 0x7F; // Mask out the MSB
+    uint8_t exceptionCode = frame[2];
+    decoded += "(Exception Response to Func 0x" + String(originalFunctionCode, HEX) + ")\n";
+    decoded += "Exception Code: 0x" + String(exceptionCode, HEX) + " (";
+    switch (exceptionCode) {
+      case 0x01: decoded += "Illegal Function"; break;
+      case 0x02: decoded += "Illegal Data Address"; break;
+      case 0x03: decoded += "Illegal Data Value"; break;
+      case 0x04: decoded += "Slave Device Failure"; break;
+      default: decoded += "Unknown"; break;
+    }
+    decoded += ")\n";
+    if (length > 5) { // If there's more than Addr + Func + ExceptionCode + CRC
+      decoded += "Extra Bytes (Non-Standard): ";
+      for (int i = 3; i < length - 2; i++) {
+        char hexChar[3];
+        sprintf(hexChar, "%02X", frame[i]);
+        decoded += String(hexChar) + " ";
+      }
+      decoded.trim();
+      decoded += "\n";
+    }
+  } else if (functionCode == 0x06 || functionCode == 0x10) { // Write Single/Multiple Registers Request
+      decoded += "(Write Registers Request)\n";
+      decoded += "Payload: ";
+      for (int i = 2; i < length - 2; i++) { // Payload starts after Function Code, ends before CRC
+        char hexChar[3];
+        sprintf(hexChar, "%02X", frame[i]);
+        decoded += String(hexChar) + " ";
+      }
+      decoded.trim();
+      decoded += "\n";
+  } else { // Other Modbus Requests or unsupported function codes
+    decoded += "(Request/Unsupported Function)\n";
+    decoded += "Payload: ";
+    for (int i = 2; i < length - 2; i++) { // Payload starts after Function Code, ends before CRC
+      char hexChar[3];
+      sprintf(hexChar, "%02X", frame[i]);
+      decoded += String(hexChar) + " ";
+    }
+    decoded.trim();
+    decoded += "\n";
+  }
+  return decoded;
+}
+
+// ====== BLE Specifics ======
+BLEScan* pBLEScan;
+BLEAdvertisedDevice* pInverterAdvertisedDevice = nullptr; // To store the device we want to connect to
+bool deviceFound = false;
+bool connectedToInverter = false;
+BLEClient* pClient = nullptr; // Global BLEClient instance
+
+// UUIDs for common services/characteristics (REPLACE WITH ACTUAL ONES ONCE FOUND!)
+// You'll discover these by observing the BLE log in the web UI.
+// Example UUIDs (replace these with your inverter's specific UUIDs):
+static BLEUUID serviceUUID("0000XXXX-0000-1000-8000-00805F9B34FB"); // Example Service UUID
+static BLEUUID charWriteUUID("0000YYYY-0000-1000-8000-00805F9B34FB"); // Example Write Characteristic UUID
+static BLEUUID charNotifyUUID("0000ZZZZ-0000-1000-8000-00805F9B34FB"); // Example Notify Characteristic UUID
+
+// BLE Client Callbacks for connection/disconnection events
+class MyClientCallbacks : public BLEClientCallbacks {
+    void onConnect(BLEClient* pClient) {
+        appendToLog(bleLogData, "[" + String(millis()) + "ms] BLE: Connected to Inverter!");
+        connectedToInverter = true;
+    }
+
+    void onDisconnect(BLEClient* pClient) {
+        appendToLog(bleLogData, "[" + String(millis()) + "ms] BLE: Disconnected from Inverter.");
+        connectedToInverter = false;
+        deviceFound = false; // Allow re-scanning for the device
+        if (pInverterAdvertisedDevice) {
+            delete pInverterAdvertisedDevice;
+            pInverterAdvertisedDevice = nullptr;
+        }
+        // Restart scan after disconnect to find the device again
+        pBLEScan->start(0, nullptr, false);
+    }
+};
+
+static MyClientCallbacks myClientCallbacks;
+static BLERemoteCharacteristic* pRemoteCharacteristicWrite;
+static BLERemoteCharacteristic* pRemoteCharacteristicNotify;
+
+// Callback for BLE notifications (when the inverter sends data updates)
+static void notifyCallback(BLERemoteCharacteristic* pBLERemoteCharacteristic,
+                           uint8_t* pData, size_t length, bool isNotify) {
+    String logMsg = "[" + String(millis()) + "ms] BLE Notify from ";
+    logMsg += pBLERemoteCharacteristic->getUUID().toString().c_str();
+    logMsg += " (Len: " + String(length) + "b): ";
+    for (int i = 0; i < length; i++) {
+        char hexChar[3];
+        sprintf(hexChar, "%02X", pData[i]);
+        logMsg += String(hexChar) + " ";
+    }
+    appendToLog(bleLogData, logMsg);
+    // You can add more sophisticated BLE GATT decoding here if needed
+    // For now, it just logs the raw hex data.
+}
+
+// Callback for when an advertised BLE device is found during scanning
+class MyAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks {
+    void onResult(BLEAdvertisedDevice advertisedDevice) {
+        String logMsg = "[" + String(millis()) + "ms] BLE: Advertised Device found: ";
+        logMsg += advertisedDevice.toString().c_str();
+        appendToLog(bleLogData, logMsg);
+
+        // Look for your inverter's specific name or service UUID in advertisements.
+        // REPLACE "Ecoworthy Inverter" with the actual name you observe in the BLE log.
+        // Uncomment the service UUID check if you know it and want to use it for identification.
+        if (advertisedDevice.getName() == "Ecoworthy Inverter" /* || (advertisedDevice.haveServiceUUID() && advertisedDevice.isServiceUUID(serviceUUID)) */) {
+            appendToLog(bleLogData, "[" + String(millis()) + "ms] BLE: Found target inverter!");
+            if (!deviceFound) { // Only store and stop scan if not already found
+                pInverterAdvertisedDevice = new BLEAdvertisedDevice(advertisedDevice);
+                deviceFound = true;
+                pBLEScan->stop(); // Stop scanning once the target device is found
+            }
+        }
+    }
+};
+
+// ====== Basic BLE GATT Data Decoding (for logging) ======
+// This function is called by the notifyCallback to log BLE data.
+void decodeBLEGATT(const uint8_t* data, size_t length) {
+  // Currently, this just logs the raw hex data received via BLE notifications.
+  // You would expand this function to interpret the meaning of the bytes
+  // based on your reverse engineering findings.
+}
+
+// ====== Signal Analysis (using ADC_PIN) ======
+// This function performs a basic FFT on analog readings, useful for RF signal analysis.
+void analyzeSignalQuality() {
+  const uint16_t samples = 128;
+  double vReal[samples];
+  double vImag[samples];
+  
+  for (int i = 0; i < samples; i++) {
+    vReal[i] = analogRead(ADC_PIN) / 4095.0 * 3.3; // Assuming 3.3V ADC reference for ESP32-C3
+    vImag[i] = 0;
+    delayMicroseconds(100); // Small delay to allow ADC to settle between readings
+  }
+
+  FFT.Windowing(vReal, samples, FFT_WIN_TYP_HAMMING, FFT_FORWARD);
+  FFT.Compute(vReal, vImag, samples, FFT_FORWARD);
+  FFT.ComplexToMagnitude(vReal, vImag, samples);
+
+  double peakFreq = FFT.MajorPeak(vReal, samples, 115200); // 115200 is sample rate, adjust if needed
+  appendToLog(bleLogData, "[" + String(millis()) + "ms] Signal: Dominant frequency: " + String(peakFreq, 2) + " Hz");
+}
+
+// ====== Cryptographic Analysis (MD5/SHA256 hashing) ======
+// This function calculates MD5 and SHA256 hashes of observed data.
+// Useful for identifying known patterns or verifying data integrity if encryption is present.
+void analyzeEncryption(const uint8_t* data, size_t length) {
+  uint8_t md5_hash[16];
+  uint8_t sha_hash[32];
+  
+  mbedtls_md5_init(&md5_ctx);
+  mbedtls_md5_starts(&md5_ctx);
+  mbedtls_md5_update(&md5_ctx, data, length);
+  mbedtls_md5_finish(&md5_ctx, md5_hash);
+  
+  mbedtls_sha256_init(&sha_ctx);
+  mbedtls_sha256_starts(&sha_ctx, 0); // 0 for SHA256, 1 for SHA224
+  mbedtls_sha256_update(&sha_ctx, data, length);
+  mbedtls_sha256_finish(&sha_ctx, sha_hash);
+  
+  String hashLog = "[" + String(millis()) + "ms] Crypto: MD5: ";
+  for (int i = 0; i < 16; i++) { char hexChar[3]; sprintf(hexChar, "%02X", md5_hash[i]); hashLog += String(hexChar); }
+  hashLog += "\n[" + String(millis()) + "ms] Crypto: SHA256: ";
+  for (int i = 0; i < 32; i++) { char hexChar[3]; sprintf(hexChar, "%02X", sha_hash[i]); hashLog += String(hexChar); }
+  appendToLog(bleLogData, hashLog); // Logs crypto analysis to BLE log (can be separated if needed)
+}
+
+// ====== Local Display Functions (OLED and TFT) ======
+// Updates the OLED display with current mode and status information.
+void updateOLED() {
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_5x8_tr); // Small font for 72x40 OLED
+
+  // Display current mode
+  switch(currentMode) {
+    case MODE_RS485:
+      u8g2.drawStr(0, 0, "RS485 Mode");
+      u8g2.drawStr(0, 10, "Packets: " + String(packetLogs.size()));
+      if (packetLogs.size() > 0) {
+        // Show length and first few bytes of the last RS485 packet
+        String lastPacketLen = "Len: " + String(packetLogs.back().length);
+        u8g2.drawStr(0, 20, lastPacketLen.c_str());
+        String hexPreview = "";
+        for(int i=0; i < min((size_t)5, packetLogs.back().length); ++i) {
+            char hexChar[3];
+            sprintf(hexChar, "%02X", packetLogs.back().data[i]);
+            hexPreview += String(hexChar);
+        }
+        u8g2.drawStr(0, 30, hexPreview.c_str());
+      } else {
+        u8g2.drawStr(0, 20, "Waiting...");
+      }
+      break;
+    case MODE_BLE:
+      u8g2.drawStr(0, 0, "BLE Mode");
+      if (connectedToInverter) {
+        u8g2.drawStr(0, 10, "Connected!");
+        u8g2.drawStr(0, 20, "Sniffing GATT");
+      } else if (deviceFound) {
+        u8g2.drawStr(0, 10, "Device Found!");
+        u8g2.drawStr(0, 20, "Connecting...");
+      } else {
+        u8g2.drawStr(0, 10, "Scanning...");
+        u8g2.drawStr(0, 20, "Looking for app");
+      }
+      u8g2.drawStr(0, 30, WiFi.localIP().toString().c_str()); // Show IP on OLED
+      break;
+    case MODE_BRIDGE:
+      u8g2.drawStr(0, 0, "Bridge Mode");
+      u8g2.drawStr(0, 10, "USB <-> RS485");
+      u8g2.drawStr(0, 20, WiFi.localIP().toString().c_str()); // Show IP on OLED
+      break;
+  }
+  u8g2.sendBuffer();
+}
+
+// Updates the TFT display with current mode and status information.
+void updateTFT() {
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString("Cypher-Lynx v1.0", 5, 5, 2); // Tool name and version
+  
+  tft.drawString("Mode:", 5, 25, 2);
+  switch(currentMode) {
+    case MODE_RS485:
+      tft.drawString("RS485 Monitor", 60, 25, 2);
+      tft.drawString("Packets:", 5, 45, 2);
+      tft.drawNumber(packetLogs.size(), 70, 45, 2);
+      break;
+    case MODE_BLE:
+      tft.drawString("Bluetooth LE", 60, 25, 2);
+      if (connectedToInverter) {
+        tft.drawString("Status: Connected", 5, 45, 2);
+      } else if (deviceFound) {
+        tft.drawString("Status: Found", 5, 45, 2);
+      } else {
+        tft.drawString("Status: Scanning", 5, 45, 2);
+      }
+      tft.drawString("IP: " + WiFi.localIP().toString(), 5, 65, 2);
+      break;
+    case MODE_BRIDGE:
+      tft.drawString("Serial Bridge", 60, 25, 2);
+      tft.drawString("USB <-> RS485", 5, 45, 2);
+      tft.drawString("IP: " + WiFi.localIP().toString(), 5, 65, 2);
+      break;
+  }
+}
+
+// ====== Web Server Handlers ======
+// Sets up all the web server routes for the UI and data endpoints.
+void setupWebServer() {
+  // Root page: Main control panel for mode switching and links to logs
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+    // Basic HTTP authentication
+    if (!request->authenticate(http_username, http_password)) {
+      return request->requestAuthentication();
+    }
+    String html = R"ENDHTML(
+      <!DOCTYPE html>
+      <html lang="en">
+      <head>
+          <meta charset="UTF-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1.0">
+          <title>Cypher-Lynx Control</title>
+          <script src="https://cdn.tailwindcss.com"></script>
+          <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+          <style>
+              body { font-family: 'Inter', sans-serif; }
+              .card {
+                  background-color: #1f2937; /* Darker gray */
+                  border-radius: 0.75rem; /* rounded-xl */
+                  padding: 1.5rem; /* p-6 */
+                  box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+              }
+          </style>
+      </head>
+      <body class="bg-gray-900 text-gray-100 min-h-screen flex flex-col items-center justify-center p-4">
+          <div class="container mx-auto max-w-md space-y-8">
+              <h1 class="text-4xl font-bold text-center text-green-400 mb-8">Cypher-Lynx Control</h1>
+
+              <div class="card w-full text-center">
+                  <h2 class="text-2xl font-semibold mb-4 text-white">Current Mode: <span id="currentModeDisplay" class="text-yellow-300">Loading...</span></h2>
+                  <button id="toggleModeBtn" class="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-3 px-6 rounded-lg text-center transition duration-300 ease-in-out transform hover:scale-105">
+                      Toggle Mode
+                  </button>
+                  <p class="text-sm text-gray-400 mt-2">
+                      (Switching modes will restart the ESP32's main loop for that mode.)
+                  </p>
+              </div>
+
+              <div class="card w-full text-center">
+                  <h2 class="text-2xl font-semibold mb-4 text-white">WiFi IP: <span class="text-blue-300">)ENDHTML" + WiFi.localIP().toString() + R"ENDHTML(</span></h2>
+                  <p class="text-sm text-gray-400">
+                      Use this IP to access the control panel.
+                  </p>
+              </div>
+
+              <div class="card w-full">
+                  <h2 class="text-2xl font-semibold mb-4 text-white">Logs</h2>
+                  <div class="flex flex-col sm:flex-row space-y-4 sm:space-y-0 sm:space-x-4">
+                      <a href="/rs485log" class="flex-1 bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 px-6 rounded-lg text-center transition duration-300 ease-in-out transform hover:scale-105">
+                          View RS485 Log
+                      </a>
+                      <a href="/blelog" class="flex-1 bg-green-600 hover:bg-green-700 text-white font-bold py-3 px-6 rounded-lg text-center transition duration-300 ease-in-out transform hover:scale-105">
+                          View BLE Log
+                      </a>
+                  </div>
+              </div>
+          </div>
+
+          <script>
+              let currentMode = ""; // To store the current operating mode
+
+              // Function to update UI based on current mode
+              function updateUIMode() {
+                  const currentModeDisplay = document.getElementById('currentModeDisplay');
+                  const toggleModeBtn = document.getElementById('toggleModeBtn');
+
+                  if (currentMode === "MODE_RS485") {
+                      currentModeDisplay.textContent = "RS485 Monitor";
+                      toggleModeBtn.textContent = "Switch to BLE Monitor Mode";
+                  } else if (currentMode === "MODE_BLE") {
+                      currentModeDisplay.textContent = "BLE Monitor";
+                      toggleModeBtn.textContent = "Switch to RS485 Monitor Mode";
+                  } else if (currentMode === "MODE_BRIDGE") {
+                      currentModeDisplay.textContent = "Serial Bridge";
+                      toggleModeBtn.textContent = "Switch to RS485 Monitor Mode"; // Default switch from bridge to RS485
+                  }
+              }
+
+              // Fetch current mode on page load
+              document.addEventListener('DOMContentLoaded', () => {
+                  fetch('/get_mode')
+                      .then(response => response.text())
+                      .then(mode => {
+                          currentMode = mode;
+                          updateUIMode();
+                      })
+                      .catch(error => {
+                          console.error('Error fetching mode:', error);
+                          document.getElementById('currentModeDisplay').textContent = "Error loading mode.";
+                      });
+              });
+
+              // Toggle mode button click handler
+              document.getElementById('toggleModeBtn').addEventListener('click', () => {
+                  let newMode;
+                  if (currentMode === "MODE_RS485") {
+                      newMode = "ble";
+                  } else if (currentMode === "MODE_BLE") {
+                      newMode = "rs485";
+                  } else if (currentMode === "MODE_BRIDGE") {
+                      newMode = "rs485"; // Default switch from bridge to RS485
+                  }
+                  
+                  fetch(`/set_mode?mode=${newMode}`)
+                      .then(response => response.text())
+                      .then(status => {
+                          console.log(status);
+                          // For simplicity, we'll just reload the page after mode switch
+                          // In a real app, you might want more sophisticated state handling
+                          window.location.reload(); 
+                      })
+                      .catch(error => console.error('Error toggling mode:', error));
+              });
+          </script>
+      </body>
+      </html>
+      )ENDHTML";
+    request->send(200, "text/html", html);
+  });
+  
+  // Endpoint to handle mode switching requests
+  server.on("/set_mode", HTTP_GET, [](AsyncWebServerRequest *request){
+    if (!request->authenticate(http_username, http_password)) {
+      return request->requestAuthentication();
+    }
+    if (request->hasParam("mode")) {
+      String modeStr = request->arg("mode");
+      if (modeStr == "rs485") {
+        currentMode = MODE_RS485;
+        Serial.println("Switched to RS485 Monitor Mode.");
+        request->send(200, "text/plain", "Switched to RS485 Monitor Mode.");
+      }
+      else if (modeStr == "ble") {
+        currentMode = MODE_BLE;
+        Serial.println("Switched to BLE Monitor Mode.");
+        request->send(200, "text/plain", "Switched to BLE Monitor Mode.");
+      }
+      else if (modeStr == "bridge") { // Direct switch to bridge mode (less common from web)
+        currentMode = MODE_BRIDGE;
+        Serial.println("Switched to Serial Bridge Mode.");
+        request->send(200, "text/plain", "Switched to Serial Bridge Mode.");
+      } else {
+        request->send(400, "text/plain", "Invalid mode.");
+      }
+    } else {
+      request->send(400, "text/plain", "Mode parameter missing.");
+    }
+  });
+
+  // Endpoint to get the current operating mode (for UI updates)
+  server.on("/get_mode", HTTP_GET, [](AsyncWebServerRequest *request){
+    String modeStr;
+    if (currentMode == MODE_RS485) modeStr = "MODE_RS485";
+    else if (currentMode == MODE_BLE) modeStr = "MODE_BLE";
+    else if (currentMode == MODE_BRIDGE) modeStr = "MODE_BRIDGE";
+    request->send(200, "text/plain", modeStr);
+  });
+
+  // --- RS485 Log Page ---
+  // Serves the HTML for the RS485 log viewer.
+  server.on("/rs485log", HTTP_GET, [](AsyncWebServerRequest *request){
+    if (!request->authenticate(http_username, http_password)) {
+      return request->requestAuthentication();
+    }
+    String html = R"ENDHTML(
+      <!DOCTYPE html>
+      <html lang="en">
+      <head>
+          <meta charset="UTF-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1.0">
+          <title>Cypher-Lynx RS485 Data Log</title>
+          <script src="https://cdn.tailwindcss.com"></script>
+          <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+          <style>
+              body { font-family: 'Inter', sans-serif; }
+              .card {
+                  background-color: #1f2937; /* Darker gray */
+                  border-radius: 0.75rem; /* rounded-xl */
+                  padding: 1.5rem; /* p-6 */
+                  box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+              }
+              pre {
+                  white-space: pre-wrap; /* Allows text to wrap */
+                  word-wrap: break-word; /* Breaks long words */
+              }
+              .log-entry-raw span {
+                  cursor: copy; /* Indicate copy action */
+                  user-select: all; /* Allow easy selection */
+              }
+              .log-entry-raw span:hover {
+                  background-color: #4a5568; /* Darker on hover */
+              }
+              .log-entry-raw .hex-byte {
+                  display: inline-block;
+                  padding: 2px 4px;
+                  border-radius: 4px;
+                  margin-right: 2px;
+              }
+              .highlight-red { background-color: #EF4444; color: white; }
+              .highlight-green { background-color: #10B981; color: white; }
+              .highlight-blue { background-color: #60A5FA; color: white; }
+              .highlight-yellow { background-color: #FBBF24; color: black; }
+          </style>
+      </head>
+      <body class="bg-gray-900 text-gray-100 min-h-screen flex flex-col items-center justify-center p-4">
+          <div class="container mx-auto max-w-4xl space-y-8">
+              <h1 class="text-4xl font-bold text-center text-green-400 mb-8">Cypher-Lynx RS485 Data Log</h1>
+
+              <div class="card w-full">
+                  <h2 class="text-2xl font-semibold mb-4 text-white">Log Filters & Highlights</h2>
+                  <div class="flex flex-col space-y-4">
+                      <div>
+                          <label for="filterText" class="text-white">Filter Text:</label>
+                          <input type="text" id="filterText" placeholder="e.g., 01 03, Slave ID: 1" class="p-2 rounded-md bg-gray-700 text-white w-full mt-1">
+                      </div>
+                      <div>
+                          <label for="highlightPattern" class="text-white">Highlight Pattern (Hex):</label>
+                          <input type="text" id="highlightPattern" placeholder="e.g., 02 0C, F0 00" class="p-2 rounded-md bg-gray-700 text-white w-full mt-1">
+                          <label for="highlightColor" class="text-white mt-2 block">Highlight Color:</label>
+                          <select id="highlightColor" class="p-2 rounded-md bg-gray-700 text-white w-full mt-1">
+                              <option value="highlight-yellow">Yellow</option>
+                              <option value="highlight-green">Green</option>
+                              <option value="highlight-blue">Blue</option>
+                              <option value="highlight-red">Red</option>
+                          </select>
+                      </div>
+                      <button id="applyLogFilters" class="bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-3 px-6 rounded-lg transition duration-300 ease-in-out transform hover:scale-105">
+                          Apply Filters & Highlights
+                      </button>
+                      <button id="clearLogFilters" class="bg-gray-600 hover:bg-gray-700 text-white font-bold py-3 px-6 rounded-lg transition duration-300 ease-in-out transform hover:scale-105">
+                          Clear Filters & Highlights
+                      </button>
+                  </div>
+              </div>
+
+              <div class="card w-full">
+                  <h2 class="text-2xl font-semibold mb-4 text-white">Register Aliases (Renames)</h2>
+                  <div class="flex flex-col space-y-4">
+                      <div class="flex flex-col sm:flex-row sm:space-x-4 space-y-2 sm:space-y-0">
+                          <input type="text" id="aliasHex" placeholder="Register Hex (e.g., 020C)" class="p-2 rounded-md bg-gray-700 text-white flex-1">
+                          <input type="text" id="aliasName" placeholder="Alias Name (e.g., PV Voltage)" class="p-2 rounded-md bg-gray-700 text-white flex-1">
+                      </div>
+                      <div class="flex space-x-4">
+                          <button id="addAliasBtn" class="flex-1 bg-green-600 hover:bg-green-700 text-white font-bold py-3 px-6 rounded-lg transition duration-300 ease-in-out transform hover:scale-105">
+                              Add Alias
+                          </button>
+                          <button id="clearAliasesBtn" class="flex-1 bg-red-600 hover:bg-red-700 text-white font-bold py-3 px-6 rounded-lg transition duration-300 ease-in-out transform hover:scale-105">
+                              Clear All Aliases
+                          </button>
+                      </div>
+                      <div id="currentAliases" class="bg-gray-800 p-3 rounded-md text-sm text-gray-400">
+                          No aliases defined.
+                      </div>
+                  </div>
+              </div>
+
+              <div class="card w-full">
+                  <h2 class="text-2xl font-semibold mb-4 text-white">Logged Raw Hex Data</h2>
+                  <pre id="logDataRaw" class="bg-gray-700 p-4 rounded-md text-sm font-mono text-gray-300">
+                      Loading raw log...
+                  </pre>
+                  <h2 class="text-2xl font-semibold mb-4 text-white mt-8">Logged Decoded Data</h2>
+                  <pre id="logDataDecoded" class="bg-gray-700 p-4 rounded-md text-sm font-mono text-cyan-300">
+                      Loading decoded log...
+                  </pre>
+                  <div class="mt-4 flex justify-center">
+                    <a href="/" class="bg-purple-600 hover:bg-purple-700 text-white font-bold py-2 px-4 rounded-lg text-center transition duration-300 ease-in-out transform hover:scale-105">
+                        Back to Control
+                    </a>
+                  </div>
+              </div>
+          </div>
+
+          <script>
+              let rawLogContent = "";
+              let decodedLogContent = "";
+              let registerAliases = {}; // Stores { "HEX_ADDRESS": "ALIAS_NAME" }
+
+              // Load aliases from localStorage on page load
+              function loadAliases() {
+                  const storedAliases = localStorage.getItem('registerAliases');
+                  if (storedAliases) {
+                      registerAliases = JSON.parse(storedAliases);
+                  }
+                  updateAliasesDisplay();
+              }
+
+              // Save aliases to localStorage
+              function saveAliases() {
+                  localStorage.setItem('registerAliases', JSON.stringify(registerAliases));
+                  updateAliasesDisplay();
+              }
+
+              // Update the display of current aliases
+              function updateAliasesDisplay() {
+                  const aliasesDiv = document.getElementById('currentAliases');
+                  if (Object.keys(registerAliases).length === 0) {
+                      aliasesDiv.innerText = "No aliases defined.";
+                  } else {
+                      aliasesDiv.innerHTML = "";
+                      for (const hex in registerAliases) {
+                          aliasesDiv.innerHTML += `<div><strong>${hex}</strong>: ${registerAliases[hex]} <button class="text-red-400 hover:text-red-600 ml-2" onclick="removeAlias('${hex}')">X</button></div>`;
+                      }
+                  }
+              }
+
+              // Remove a single alias
+              function removeAlias(hex) {
+                  delete registerAliases[hex];
+                  saveAliases();
+                  applyLogFiltersAndHighlights(); // Re-render log with updated aliases
+              }
+
+
+              // Function to apply filters and highlights
+              function applyLogFiltersAndHighlights() {
+                  const filterText = document.getElementById('filterText').value.toLowerCase();
+                  const highlightPattern = document.getElementById('highlightPattern').value.toLowerCase().replace(/\s/g, '');
+                  const highlightColorClass = document.getElementById('highlightColor').value;
+
+                  const rawLogLines = rawLogContent.split('\n');
+                 i const decodedLogLines = decodedLogContent.split('\n');
+
+                  let filteredRawHtml = "";
+                  let filteredDecodedHtml = "";
+
+                  for (let i = 0; i < rawLogLines.length; i++) {
+                      const rawLine = rawLogLines[i];
+                      const decodedLine = decodedLogLines[i] || ""; // Ensure decodedLine exists
+
+                      let shouldDisplay = true;
+                      if (filterText) {
+                          if (!rawLine.toLowerCase().includes(filterText) && !decodedLine.toLowerCase().includes(filterText)) {
+                              shouldDisplay = false;
+                          }
+                      }
+
+                      if (shouldDisplay) {
+                          // Apply highlighting to raw hex
+                          let highlightedRawLine = rawLine;
+                          if (highlightPattern && highlightPattern.length > 0) {
+                              // Split the raw line into timestamp part and hex part
+                              const match = rawLine.match(/^(\[.*?\]\s*)(.*)$/);
+                              if (match) {
+                                  const timestampPart = match[1];
+                                  const hexPart = match[2];
+                                  const regex = new RegExp(`(${highlightPattern})`, 'gi');
+                                  highlightedRawLine = timestampPart + hexPart.replace(regex, `<span class="${highlightColorClass}">$1</span>`);
+                              }
+                          }
+                          // Make each hex byte clickable for copying
+                          const clickableRawLine = highlightedRawLine.replace(/([0-9A-Fa-f]{2})/g, '<span class="hex-byte">$1</span>');
+                          filteredRawHtml += `<div class="log-entry-raw">${clickableRawLine}</div>`;
+
+                          // Apply aliases to decoded log
+                          let aliasedDecodedLine = decodedLine;
+                          for (const hex in registerAliases) {
+                              // Replace "Reg X (0xABCD): VALUE" with "ALIAS_NAME: VALUE"
+                              const regex = new RegExp(`(Reg \\d+ \\(0x${hex}\\):)`, 'g');
+                              aliasedDecodedLine = aliasedDecodedLine.replace(regex, `${registerAliases[hex]}:`);
+                          }
+                          filteredDecodedHtml += `<div class="log-entry-decoded">${aliasedDecodedLine}</div>`;
+                      }
+                  }
+
+                  document.getElementById('logDataRaw').innerHTML = filteredRawHtml || "No matching raw data.";
+                  document.getElementById('logDataDecoded').innerHTML = filteredDecodedHtml || "No matching decoded data.";
+
+                  // Add click listener for copying hex bytes to raw log
+                  document.querySelectorAll('.log-entry-raw .hex-byte').forEach(span => {
+                      span.addEventListener('click', function() {
+                          const copiedHex = this.textContent.trim();
+                          localStorage.setItem('copiedHexCommand', copiedHex);
+                          // Optionally, provide visual feedback
+                          this.style.backgroundColor = '#60A5FA'; // Blue
+                          setTimeout(() => this.style.backgroundColor = '', 500); // Reset after 0.5s
+                      });
+                  });
+              }
+
+              function fetchLogData() {
+                  fetch('/get_rs485_raw_log')
+                      .then(response => response.text())
+                      .then(data => {
+                          rawLogContent = data;
+                          applyLogFiltersAndHighlights();
+                      })
+                      .catch(error => {
+                          console.error('Error fetching raw log data:', error);
+                          document.getElementById('logDataRaw').innerText = 'Error loading raw log.';
+                      });
+                  
+                  fetch('/get_rs485_decoded_log')
+                      .then(response => response.text())
+                      .then(data => {
+                          decodedLogContent = data;
+                          applyLogFiltersAndHighlights(); // Re-apply filters with decoded data
+                      })
+                      .catch(error => {
+                          console.error('Error fetching decoded log data:', error);
+                          document.getElementById('logDataDecoded').innerText = 'Error loading decoded log.';
+                      });
+              }
+
+              // Event listeners for log page controls
+              document.getElementById('applyLogFilters').addEventListener('click', applyLogFiltersAndHighlights);
+              document.getElementById('clearLogFilters').addEventListener('click', () => {
+                  document.getElementById('filterText').value = '';
+                  document.getElementById('highlightPattern').value = '';
+                  applyLogFiltersAndHighlights();
+              });
+
+              // Alias management
+              document.getElementById('addAliasBtn').addEventListener('click', () => {
+                  const hex = document.getElementById('aliasHex').value.trim().toUpperCase();
+                  const name = document.getElementById('aliasName').value.trim();
+                  if (hex && name) {
+                      registerAliases[hex] = name;
+                      saveAliases();
+                      document.getElementById('aliasHex').value = '';
+                      document.getElementById('aliasName').value = '';
+                      applyLogFiltersAndHighlights(); // Re-render log with new aliases
+                  } else {
+                      alert('Please enter both hex address and alias name.');
+                  }
+              });
+
+              document.getElementById('clearAliasesBtn').addEventListener('click', () => {
+                  if (confirm('Are you sure you want to clear all aliases?')) {
+                      registerAliases = {};
+                      saveAliases();
+                      applyLogFiltersAndHighlights(); // Re-render log
+                  }
+              });
+
+
+              loadAliases(); // Load aliases on page load
+              fetchLogData(); // Initial fetch
+          </script>
+      </body>
+      </html>
+      )ENDHTML";
+    request->send(200, "text/html", html);
+  });
+
+  // Endpoint to serve raw RS485 log data
+  server.on("/get_rs485_raw_log", HTTP_GET, [](AsyncWebServerRequest *request){
+    if (!request->authenticate(http_username, http_password)) {
+      return request->requestAuthentication();
+    }
+    request->send(200, "text/plain", rs485LogDataRaw);
+  });
+
+  // Endpoint to serve decoded RS485 log data
+  server.on("/get_rs485_decoded_log", HTTP_GET, [](AsyncWebServerRequest *request){
+    if (!request->authenticate(http_username, http_password)) {
+      return request->requestAuthentication();
+    }
+    request->send(200, "text/plain", rs485LogDataDecoded);
+  });
+
+  // --- BLE Log Page ---
+  // Serves the HTML for the BLE log viewer.
+  server.on("/blelog", HTTP_GET, [](AsyncWebServerRequest *request){
+    if (!request->authenticate(http_username, http_password)) {
+      return request->requestAuthentication();
+    }
+    String html = R"ENDHTML(
+      <!DOCTYPE html>
+      <html lang="en">
+      <head>
+          <meta charset="UTF-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1.0">
+          <title>Cypher-Lynx BLE Data Log</title>
+          <script src="https://cdn.tailwindcss.com"></script>
+          <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+          <style>
+              body { font-family: 'Inter', sans-serif; }
+              .card {
+                  background-color: #1f2937; /* Darker gray */
+                  border-radius: 0.75rem; /* rounded-xl */
+                  padding: 1.5rem; /* p-6 */
+                  box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+              }
+              pre {
+                  white-space: pre-wrap; /* Allows text to wrap */
+                  word-wrap: break-word; /* Breaks long words */
+              }
+          </style>
+      </head>
+      <body class="bg-gray-900 text-gray-100 min-h-screen flex flex-col items-center justify-center p-4">
+          <div class="container mx-auto max-w-4xl space-y-8">
+              <h1 class="text-4xl font-bold text-center text-green-400 mb-8">Cypher-Lynx BLE Data Log</h1>
+
+              <div class="card w-full">
+                  <h2 class="text-2xl font-semibold mb-4 text-white">BLE Activity Log</h2>
+                  <pre id="bleLogContent" class="bg-gray-700 p-4 rounded-md text-sm font-mono text-cyan-300">
+                      Loading BLE log...
+                  </pre>
+                  <div class="mt-4 flex justify-center">
+                    <a href="/" class="bg-purple-600 hover:bg-purple-700 text-white font-bold py-2 px-4 rounded-lg text-center transition duration-300 ease-in-out transform hover:scale-105">
+                        Back to Control
+                    </a>
+                  </div>
+              </div>
+          </div>
+
+          <script>
+              function fetchBleLogData() {
+                  fetch('/get_ble_log')
+                      .then(response => response.text())
+                      .then(data => {
+                          document.getElementById('bleLogContent').innerText = data;
+                      })
+                      .catch(error => {
+                          console.error('Error fetching BLE log data:', error);
+                          document.getElementById('bleLogContent').innerText = 'Error loading BLE log.';
+                      });
+              }
+              setInterval(fetchBleLogData, 1000); // Refresh BLE log every second
+              fetchBleLogData(); // Initial fetch
+          </script>
+      </body>
+      </html>
+      )ENDHTML";
+    request->send(200, "text/html", html);
+  });
+
+  // Endpoint to serve BLE log data
+  server.on("/get_ble_log", HTTP_GET, [](AsyncWebServerRequest *request){
+    if (!request->authenticate(http_username, http_password)) {
+      return request->requestAuthentication();
+    }
+    request->send(200, "text/plain", bleLogData);
+  });
+
+  // Start the web server
+  server.begin();
+  Serial.println("Web server started.");
+}
+
+// ====== MAIN SETUP FUNCTION ======
+// This function runs once when the ESP32 starts up.
+void setup() {
+  Serial.begin(115200); // Initialize USB Serial for debugging and bridge mode output
+  Serial.println("\nStarting Cypher-Lynx: ESP32-C3 Multi-Protocol RE Tool...");
+  
+  // Initialize OLED display
+  if (!u8g2.begin()) {
+    Serial.println(F("U8g2 OLED allocation failed or not found!"));
+    // If OLED fails, the tool can still function via web UI, but display won't work.
+    // Consider adding a fallback message to web UI if display is critical.
+  }
+  u8g2.setContrast(255); // Set contrast (optional)
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_5x8_tr);
+  u8g2.drawStr(0, 10, "Cypher-Lynx");
+  u8g2.drawStr(0, 20, "Starting...");
+  u8g2.sendBuffer();
+  delay(2000); // Give time for display message to be seen
+
+  // Initialize TFT display
+  tft.init();
+  tft.setRotation(1); // Adjust rotation as needed for your TFT display
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString("Cypher-Lynx Starting...", 5, 5, 2);
+  
+  // Configure RS485 control pins (even if not in RS485 mode initially)
+  pinMode(RS485_DE_PIN, OUTPUT);
+  pinMode(RS485_RE_PIN, OUTPUT);
+  setRS485ReceiveMode(); // Default to receive mode for passive listening
+
+  // Initialize Serial1 for RS485 communication
+  // Default baud rate for consistency; can be changed via web UI.
+  Serial1.begin(9600, SERIAL_8N1, RS485_RX_PIN, RS485_TX_PIN);
+  packetSerial.setStream(&Serial1); // Link PacketSerial to Serial1 for RS485
+  packetSerial.setPacketHandler([](const uint8_t* buffer, size_t size) {
+    // This handler processes received RS485 packets
+    // Only active when currentMode is MODE_RS485
+    PacketLog log;
+    memcpy(log.data, buffer, size);
+    log.length = size;
+    log.timestamp = millis();
+    // Signal strength analysis (if ADC_PIN is connected)
+    log.signalStrength = analogRead(ADC_PIN) / 4095.0; // Assuming 3.3V ADC reference
+    packetLogs.push_back(log); // Store raw packet for logging
+
+    // Convert raw packet to hex string for raw log
+    String currentPacketHex = "";
+    for (uint8_t i = 0; i < size; i++) {
+        char hexChar[3];
+        sprintf(hexChar, "%02X", buffer[i]);
+        currentPacketHex += String(hexChar) + " ";
+    }
+    currentPacketHex.trim();
+    appendToLog(rs485LogDataRaw, "[" + String(millis()) + "ms, Len:" + String(size) + "b] " + currentPacketHex);
+    
+    // Decode and append to decoded log
+    appendToLog(rs485LogDataDecoded, decodeModbusFrame((uint8_t*)buffer, size));
+  });
+  
+  // Initialize WiFi (ESP32 acts as an Access Point for the web UI)
+  WiFi.softAP(ssid, password);
+  WiFi.softAPConfig(local_ip, gateway, subnet);
+  Serial.print("WiFi SoftAP IP: ");
+  Serial.println(WiFi.softAPIP());
+  
+  // Initialize web server
+  setupWebServer();
+  server.begin();
+  
+  // Initialize BLE (always initialized, but only active in MODE_BLE)
+  BLEDevice::init("Cypher-Lynx_BLE_Sniffer"); // Name your ESP32 for BLE advertisements
+  pBLEScan = BLEDevice::getScan(); // Get a BLEScan object
+  pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks()); // Set callback for found devices
+  pBLEScan->setActiveScan(true); // Active scan requests more info from advertisers
+  pBLEScan->setInterval(100); // Scan interval in ms
+  pBLEScan->setWindow(90); // Scan window in ms (should be <= interval)
+
+  Serial.println("Cypher-Lynx Ready. Starting in BLE Monitor Mode.");
+  updateOLED();
+  updateTFT();
+}
+
+// ====== MAIN LOOP FUNCTION ======
+// This function runs repeatedly after setup().
+void loop() {
+  // Update local displays periodically
+  static unsigned long lastDisplayUpdate = 0;
+  if (millis() - lastDisplayUpdate > 1000) { // Update displays every second
+    updateOLED();
+    updateTFT();
+    lastDisplayUpdate = millis();
+  }
+
+  // Main logic based on the current operating mode
+  switch(currentMode) {
+    case MODE_RS485:
+      // In RS485 monitor mode, PacketSerial handles reception automatically.
+      packetSerial.update(); 
+      // Optional: Perform signal or crypto analysis on the last received RS485 packet
+      // if (packetLogs.size() > 0) {
+      //   analyzeSignalQuality(); // Requires ADC_PIN connected to RS485 signal
+      //   analyzeEncryption(packetLogs.back().data, packetLogs.back().length);
+      // }
+      break;
+
+    case MODE_BLE:
+      if (!connectedToInverter) {
+        if (deviceFound) {
+          // If a target BLE device is found but not yet connected, attempt connection.
+          if (!pClient) { // Create client instance only once
+            pClient = BLEDevice::createClient();
+            pClient->setClientCallbacks(&myClientCallbacks);
+          }
+          String logMsg = "[" + String(millis()) + "ms] BLE: Attempting to connect to ";
+          logMsg += pInverterAdvertisedDevice->getAddress().toString().c_str();
+          appendToLog(bleLogData, logMsg);
+          
+          if (pClient->connect(pInverterAdvertisedDevice)) {
+            appendToLog(bleLogData, "[" + String(millis()) + "ms] BLE: Connected to Inverter!");
+            connectedToInverter = true;
+
+            // Discover GATT services and characteristics
+            appendToLog(bleLogData, "[" + String(millis()) + "ms] BLE: Discovering services...");
+            BLERemoteService* pRemoteService = pClient->getService(serviceUUID);
+            if (pRemoteService == nullptr) {
+              appendToLog(bleLogData, "[" + String(millis()) + "ms] BLE: Failed to find service UUID: " + String(serviceUUID.toString().c_str()));
+              pClient->disconnect(); // Disconnect if critical service is not found
+              return;
+            }
+            appendToLog(bleLogData, "[" + String(millis()) + "ms] BLE: Found service: " + String(pRemoteService->getUUID().toString().c_str()));
+
+            appendToLog(bleLogData, "[" + String(millis()) + "ms] BLE: Discovering characteristics...");
+            pRemoteCharacteristicWrite = pRemoteService->getCharacteristic(charWriteUUID);
+            if (pRemoteCharacteristicWrite == nullptr) {
+              appendToLog(bleLogData, "[" + String(millis()) + "ms] BLE: Failed to find write characteristic UUID: " + String(charWriteUUID.toString().c_str()));
+              // Not critical to disconnect here if write char is optional, but depends on RE goal.
+            } else {
+              appendToLog(bleLogData, "[" + String(millis()) + "ms] BLE: Found write characteristic: " + String(pRemoteCharacteristicWrite->getUUID().toString().c_str()));
+            }
+
+            pRemoteCharacteristicNotify = pRemoteService->getCharacteristic(charNotifyUUID);
+            if (pRemoteCharacteristicNotify == nullptr) {
+              appendToLog(bleLogData, "[" + String(millis()) + "ms] BLE: Failed to find notify characteristic UUID: " + String(charNotifyUUID.toString().c_str()));
+              // Not all devices have notify characteristics.
+            } else {
+              appendToLog(bleLogData, "[" + String(millis()) + "ms] BLE: Found notify characteristic: " + String(pRemoteCharacteristicNotify->getUUID().toString().c_str()));
+              if (pRemoteCharacteristicNotify->canNotify()) {
+                pRemoteCharacteristicNotify->registerForNotify(notifyCallback);
+                appendToLog(bleLogData, "[" + String(millis()) + "ms] BLE: Registered for notifications.");
+              }
+            }
+            // At this point, the ESP32 is connected and ready to observe/interact.
+
+          } else {
+            appendToLog(bleLogData, "[" + String(millis()) + "ms] BLE: Failed to connect. Retrying scan...");
+            deviceFound = false; // Allow re-scanning for the device
+            if (pInverterAdvertisedDevice) { // Clean up stored device
+                delete pInverterAdvertisedDevice;
+                pInverterAdvertisedDevice = nullptr;
+            }
+            if (pClient) { // Ensure client is properly disconnected before retrying
+                pClient->disconnect();
+            }
+          }
+        } else {
+          // If no target device is found, start or continue BLE scanning.
+          appendToLog(bleLogData, "[" + String(millis()) + "ms] BLE: Starting scan...");
+          pBLEScan->start(0, nullptr, false); // Scan indefinitely, no callback yet, don't stop
+        }
+      } else { // If already connected to inverter (in MODE_BLE)
+        // This is where you would add logic for active BLE interactions if desired,
+        // e.g., reading specific characteristics periodically, or sending commands.
+        // For RE, you'll primarily be observing notifications triggered by the phone app.
+        delay(100); // Small delay to prevent watchdog timeout in a busy loop
+      }
+      break;
+
+    case MODE_BRIDGE:
+      // Serial Bridge Mode: Transparently forwards data between USB Serial and RS485
+      // Read from USB Serial (Serial0) and forward to RS485 (Serial1)
+      if (Serial.available()) {
+        setRS485TransmitMode(); // Switch RS485 transceiver to transmit mode
+        delayMicroseconds(100); // Small delay for DE/RE pins to stabilize
+        while (Serial.available()) {
+          Serial1.write(Serial.read()); // Read from USB, write to RS485
+        }
+        Serial1.flush(); // Ensure all bytes are sent before switching direction
+        setRS485ReceiveMode(); // Switch back to receive mode
+      }
+
+      // Read from RS485 (Serial1) and forward to USB Serial (Serial0)
+      if (Serial1.available()) {
+        while (Serial1.available()) {
+          Serial.write(Serial1.read()); // Read from RS485, write to USB
+        }
+      }
+      break;
+  }
+  delay(1); // Small delay for overall loop stability
+}
